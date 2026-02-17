@@ -1,157 +1,210 @@
 import os
 import time
+import datetime
 import telebot
+from telebot import types
 from openai import OpenAI
 
-# =========================
-# 1) ENV (Railway Variables)
-# =========================
+# ======================
+# ENV
+# ======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not TELEGRAM_TOKEN:
-    raise ValueError("❌ Railway Variables: не найдена переменная TELEGRAM_TOKEN")
-if not OPENAI_API_KEY:
-    raise ValueError("❌ Railway Variables: не найдена переменная OPENAI_API_KEY")
+    raise RuntimeError("❌ TELEGRAM_TOKEN не найден в Railway Variables")
 
-# =========================
-# 2) Init clients
-# =========================
+if not OPENAI_API_KEY:
+    raise RuntimeError("❌ OPENAI_API_KEY не найден в Railway Variables")
+
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# =========================
-# 3) Style / System prompt
-# =========================
-SYSTEM_PROMPT = (
-    "Ты — телеграм-бот CapitalMind 🚀\n"
-    "Всегда отвечай ТОЛЬКО на русском языке.\n"
-    "Пиши живо, уверенно и дружелюбно, используй эмодзи по смыслу (🚀🔥📈💡🤝💰).\n"
-    "Пиши коротко и понятно. Если нужно — структурируй списками.\n"
-    "Если вопрос непонятен — задай 1 уточняющий вопрос.\n"
-    "Никогда не говори, что ты 'языковая модель' или 'AI от OpenAI'.\n"
-)
+# ======================
+# CONFIG
+# ======================
+FREE_LIMIT = 5
+PRO_PRICE_STARS = 200
 
-# =========================
-# 4) Simple anti-spam (optional)
-# =========================
-# Ограничим частоту /ai, чтобы не улететь в расходы: 1 запрос в 3 секунды на пользователя.
-LAST_AI_CALL = {}  # user_id -> timestamp
-AI_COOLDOWN_SEC = 3
+users = {}
+ai_mode = {}
 
-def can_call_ai(user_id: int) -> bool:
-    now = time.time()
-    last = LAST_AI_CALL.get(user_id, 0)
-    if now - last < AI_COOLDOWN_SEC:
-        return False
-    LAST_AI_CALL[user_id] = now
-    return True
+# ======================
+# MENU
+# ======================
+def main_menu():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add("🤖 AI", "👤 Профиль")
+    kb.add("⭐ PRO", "❓ Помощь")
+    return kb
 
-# =========================
-# 5) Commands
-# =========================
+# ======================
+# USER HELPERS
+# ======================
+def get_user(user_id):
+    return users.setdefault(user_id, {
+        "questions_today": 0,
+        "last_date": datetime.date.today(),
+        "pro_until": None
+    })
+
+def is_pro(user_id):
+    u = get_user(user_id)
+    return u["pro_until"] and u["pro_until"] > datetime.datetime.now()
+
+def can_use(user_id):
+    u = get_user(user_id)
+
+    if is_pro(user_id):
+        return True
+
+    if u["last_date"] != datetime.date.today():
+        u["questions_today"] = 0
+        u["last_date"] = datetime.date.today()
+
+    if u["questions_today"] < FREE_LIMIT:
+        u["questions_today"] += 1
+        return True
+
+    return False
+
+# ======================
+# START
+# ======================
 @bot.message_handler(commands=["start"])
-def cmd_start(message):
+def start(message):
     bot.send_message(
         message.chat.id,
-        "🚀 <b>CapitalMind</b> на связи!\n\n"
-        "Я помогу тебе:\n"
-        "• 💰 понять, как зарабатывать и не сливать деньги\n"
-        "• 📈 составить план действий\n"
-        "• 🔥 быстро объяснить сложное простыми словами\n\n"
-        "✅ Чтобы задать вопрос ИИ, пиши так:\n"
-        "<b>/ai</b> Как заработать первые 500$?\n\n"
-        "Команды:\n"
-        "• /ai — спросить ИИ\n"
-        "• /help — как пользоваться"
+        "🚀 <b>CapitalMind</b>\n\n"
+        "Я твой AI-помощник по финансам, развитию и стратегиям 💰📈\n\n"
+        "💎 Бесплатно: 5 вопросов в день\n"
+        "⭐ PRO: безлимит + приоритет\n\n"
+        "Выбирай кнопку ниже 👇",
+        reply_markup=main_menu()
     )
 
-@bot.message_handler(commands=["help"])
-def cmd_help(message):
+# ======================
+# HELP
+# ======================
+@bot.message_handler(func=lambda m: m.text == "❓ Помощь")
+def help_btn(message):
     bot.send_message(
         message.chat.id,
-        "🧠 <b>Как пользоваться</b>\n\n"
-        "1) Пиши команду <b>/ai</b> и сразу вопрос:\n"
-        "   <b>/ai</b> Как накопить 10 000 грн за 2 месяца?\n\n"
-        "2) Я отвечу кратко и по делу, со стратегией 🚀\n\n"
-        "Если бот не отвечает — проверь, что он задеплоен и переменные добавлены ✅"
+        "🤖 <b>Как пользоваться ботом:</b>\n\n"
+        "1️⃣ Нажми <b>AI</b>\n"
+        "2️⃣ Напиши вопрос\n"
+        "3️⃣ Получи умный ответ 🚀\n\n"
+        "Хочешь безлимит? Жми ⭐ PRO",
+        reply_markup=main_menu()
     )
 
-@bot.message_handler(commands=["ai"])
-def cmd_ai(message):
-    user_id = message.from_user.id if message.from_user else 0
+# ======================
+# PROFILE
+# ======================
+@bot.message_handler(func=lambda m: m.text == "👤 Профиль")
+def profile(message):
+    user_id = message.from_user.id
+    u = get_user(user_id)
 
-    # Вырезаем "/ai " из текста
-    full_text = message.text or ""
-    parts = full_text.split(" ", 1)
-    if len(parts) < 2 or not parts[1].strip():
+    bot.send_message(
+        message.chat.id,
+        f"👤 <b>Твой профиль</b>\n\n"
+        f"📊 Вопросов сегодня: {u['questions_today']}/{FREE_LIMIT}\n"
+        f"💎 PRO: {'✅ активен' if is_pro(user_id) else '❌ нет'}\n",
+        reply_markup=main_menu()
+    )
+
+# ======================
+# PRO PURCHASE
+# ======================
+@bot.message_handler(func=lambda m: m.text == "⭐ PRO")
+def buy_pro(message):
+    prices = [types.LabeledPrice(label="PRO подписка", amount=PRO_PRICE_STARS)]
+
+    bot.send_invoice(
+        message.chat.id,
+        title="⭐ PRO CapitalMind",
+        description="Безлимитный доступ к AI на 30 дней 🚀",
+        invoice_payload="pro-subscription",
+        provider_token="",  # для Stars оставить пустым
+        currency="XTR",
+        prices=prices,
+        start_parameter="buy-pro"
+    )
+
+@bot.pre_checkout_query_handler(func=lambda query: True)
+def checkout(pre_checkout_query):
+    bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+@bot.message_handler(content_types=['successful_payment'])
+def got_payment(message):
+    user_id = message.from_user.id
+    u = get_user(user_id)
+    u["pro_until"] = datetime.datetime.now() + datetime.timedelta(days=30)
+
+    bot.send_message(
+        message.chat.id,
+        "🎉 <b>Оплата прошла успешно!</b>\n\n"
+        "⭐ PRO активирован на 30 дней 🚀\n"
+        "Теперь у тебя безлимит!",
+        reply_markup=main_menu()
+    )
+
+# ======================
+# AI BUTTON
+# ======================
+@bot.message_handler(func=lambda m: m.text == "🤖 AI")
+def ai_button(message):
+    ai_mode[message.chat.id] = True
+    bot.send_message(
+        message.chat.id,
+        "🤖 Режим AI включён!\n\n"
+        "Напиши свой вопрос ниже 👇",
+        reply_markup=main_menu()
+    )
+
+# ======================
+# AI RESPONSE
+# ======================
+@bot.message_handler(func=lambda m: True, content_types=["text"])
+def handle_text(message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+
+    if not ai_mode.get(chat_id):
+        return
+
+    if not can_use(user_id):
         bot.send_message(
-            message.chat.id,
-            "✍️ Напиши вопрос после <b>/ai</b>.\n"
-            "Пример: <b>/ai</b> Как начать зарабатывать в 15–16 лет?"
+            chat_id,
+            "🚫 Лимит бесплатных вопросов исчерпан.\n\n"
+            "Купи ⭐ PRO за 200 Stars и получи безлимит 🚀",
+            reply_markup=main_menu()
         )
         return
 
-    if not can_call_ai(user_id):
-        bot.send_message(
-            message.chat.id,
-            f"⏳ Подожди {AI_COOLDOWN_SEC} сек и попробуй снова 🙌"
-        )
-        return
-
-    question = parts[1].strip()
-
-    # Можем показать "печатает..."
-    bot.send_chat_action(message.chat.id, "typing")
+    bot.send_chat_action(chat_id, "typing")
 
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": question},
-            ],
+                {
+                    "role": "system",
+                    "content": "Ты финансовый AI-ассистент. Отвечай по-русски, структурировано, с эмодзи 🚀📈💰."
+                },
+                {"role": "user", "content": message.text}
+            ]
         )
-        answer = (response.choices[0].message.content or "").strip()
 
-        if not answer:
-            answer = "🤔 Пустой ответ. Попробуй переформулировать вопрос."
-
-        # маленькая “подпись” в конце, чтобы выглядело фирменно
-        answer = answer + "\n\n🤝 <b>CapitalMind</b>"
-
-        bot.send_message(message.chat.id, answer)
+        answer = response.choices[0].message.content
+        bot.send_message(chat_id, answer, reply_markup=main_menu())
 
     except Exception as e:
-        # Типовые ошибки: нет биллинга/квоты/неверный ключ и т.д.
-        bot.send_message(
-            message.chat.id,
-            "⚠️ Упс, что-то пошло не так.\n"
-            "Проверь:\n"
-            "• ✅ Railway Variables: <b>OPENAI_API_KEY</b>\n"
-            "• ✅ есть биллинг/кредит на OpenAI\n"
-            "• ✅ бот задеплоен (Deploy Completed)\n\n"
-            f"Текст ошибки (для логов): <code>{str(e)[:180]}</code>"
-        )
+        bot.send_message(chat_id, f"❌ Ошибка AI: {e}")
 
-# =========================
-# 6) Fallback: если пишут без /ai
-# =========================
-@bot.message_handler(func=lambda m: True)
-def fallback(message):
-    bot.send_message(
-        message.chat.id,
-        "💡 Я отвечаю через команду <b>/ai</b>.\n"
-        "Например:\n"
-        "<b>/ai</b> Как перестать сливать деньги и начать копить? 🚀"
-    )
-
-# =========================
-# 7) Start polling (important for Railway)
-# =========================
-# Убираем webhook на всякий случай (чтобы избежать конфликтов режима webhook/polling)
+# ======================
+# RUN
+# ======================
 bot.remove_webhook()
-
-# skip_pending=True — чтобы после рестарта не прилетели старые сообщения пачкой
-# timeout — держим соединение стабильнее
 bot.infinity_polling(skip_pending=True, timeout=30)
