@@ -1,198 +1,166 @@
 import os
-import json
 import telebot
 from telebot import types
 from openai import OpenAI
 
-# ================= CONFIG =================
+# ====== ТОКЕНЫ ======
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-ADMIN_ID =1215610657   # <-- ВСТАВЬ СВОЙ TELEGRAM ID
-CARD_NUMBER = "4441114434646897"  # <-- ВСТАВЬ СВОЮ КАРТУ
-PRO_PRICE = "200 грн"
-FREE_LIMIT = 5
-
-DATA_FILE = "users.json"
-
-# ==========================================
-
-bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ================= STORAGE =================
-if os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "r") as f:
-        users = json.load(f)
-else:
-    users = {}
+# ====== ТВОИ ДАННЫЕ ======
+CARD_NUMBER = "4441114434646897"
+ADMIN_ID = "1215610657"
 
-def save_users():
-    with open(DATA_FILE, "w") as f:
-        json.dump(users, f)
-
-def get_user(user_id):
-    user_id = str(user_id)
-    if user_id not in users:
-        users[user_id] = {
-            "is_pro": False,
-            "questions_today": 0
-        }
-        save_users()
-    return users[user_id]
-
-# ================= MENU =================
+# ====== ГЛАВНОЕ МЕНЮ ======
 def main_menu():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add("🤖 Задать вопрос")
     markup.add("👤 Профиль", "💎 PRO")
     markup.add("🚀 Карьера", "❓ Помощь")
+    markup.add("🤖 Задать вопрос")
     return markup
 
-# ================= START =================
-@bot.message_handler(commands=["start"])
+# ====== START ======
+@bot.message_handler(commands=['start'])
 def start(message):
     bot.send_message(
         message.chat.id,
-        "🚀 <b>CapitalMind</b>\n\n"
-        "Твой AI-ассистент по развитию и финансам 💰\n\n"
-        "🆓 Бесплатно: 5 вопросов\n"
-        "💎 PRO: безлимит\n\n"
-        "Выбирай ниже 👇",
+        "🚀 Добро пожаловать в CapitalMind!\n\n"
+        "💰 Умный AI помощник по финансам\n"
+        "⭐ PRO версия — 200 ⭐\n\n"
+        "Выберите действие ниже 👇",
         reply_markup=main_menu()
     )
 
-# ================= PROFILE =================
+# ====== ПРОФИЛЬ ======
 @bot.message_handler(func=lambda m: m.text == "👤 Профиль")
 def profile(message):
-    user = get_user(message.from_user.id)
-    status = "💎 PRO" if user["is_pro"] else "🆓 Бесплатный"
-
     bot.send_message(
         message.chat.id,
-        f"👤 <b>Профиль</b>\n\n"
-        f"ID: <code>{message.from_user.id}</code>\n"
-        f"Статус: {status}\n"
-        f"Вопросов сегодня: {user['questions_today']}/{FREE_LIMIT}"
+        f"👤 Ваш профиль:\n\n"
+        f"🆔 ID: {message.from_user.id}\n"
+        f"⭐ Статус: Free\n\n"
+        f"Хотите больше возможностей? Нажмите 💎 PRO"
     )
 
-# ================= PRO INFO =================
+# ====== PRO ======
 @bot.message_handler(func=lambda m: m.text == "💎 PRO")
-def pro_info(message):
+def pro(message):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("💳 Оплатить PRO")
+    markup.add("🔙 Назад")
+
     bot.send_message(
         message.chat.id,
-        f"💎 <b>PRO подписка</b>\n\n"
-        f"✨ Безлимитные ответы\n"
-        f"🚀 Более глубокий анализ\n\n"
-        f"💰 Цена: {PRO_PRICE}\n\n"
-        f"Для оплаты нажми: <b>Оплатить PRO</b>"
+        "💎 PRO подписка — 200 ⭐\n\n"
+        "Что дает PRO:\n"
+        "🔥 Приоритетные ответы\n"
+        "⚡ Быстрее AI\n"
+        "📊 Расширенный анализ\n\n"
+        "Нажмите оплатить 👇",
+        reply_markup=markup
     )
 
-@bot.message_handler(func=lambda m: m.text == "Оплатить PRO")
-def payment_instruction(message):
+# ====== ОПЛАТА ======
+@bot.message_handler(func=lambda m: m.text == "💳 Оплатить PRO")
+def pay(message):
     bot.send_message(
         message.chat.id,
-        f"💳 <b>Оплата PRO</b>\n\n"
-        f"Переведи {PRO_PRICE} на карту:\n"
-        f"<code>{CARD_NUMBER}</code>\n\n"
-        f"После перевода напиши:\n"
-        f"<b>Я оплатил</b>"
+        f"💳 Для оплаты PRO (200 ⭐)\n\n"
+        f"Переведите 200 ⭐ (или эквивалент)\n"
+        f"на карту:\n\n"
+        f"💳 {CARD_NUMBER}\n\n"
+        f"После перевода нажмите 'Я оплатил' 👇"
     )
 
-@bot.message_handler(func=lambda m: m.text == "Я оплатил")
-def payment_notify(message):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("✅ Я оплатил")
+    markup.add("🔙 Назад")
+    bot.send_message(message.chat.id, "Ожидаю подтверждение оплаты 💬", reply_markup=markup)
+
+# ====== ПОДТВЕРЖДЕНИЕ ======
+@bot.message_handler(func=lambda m: m.text == "✅ Я оплатил")
+def confirm_payment(message):
+    bot.send_message(
+        message.chat.id,
+        "⏳ Проверяем оплату...\n"
+        "Администратор скоро подтвердит ✅"
+    )
+
     bot.send_message(
         ADMIN_ID,
-        f"💰 Пользователь {message.from_user.id} сообщил об оплате."
-    )
-    bot.send_message(
-        message.chat.id,
-        "⏳ Ожидай подтверждения администратора."
+        f"💰 Новая заявка на PRO!\n\n"
+        f"Пользователь: @{message.from_user.username}\n"
+        f"ID: {message.from_user.id}"
     )
 
-# ================= ACTIVATE PRO =================
-@bot.message_handler(commands=["activate"])
-def activate_pro(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    try:
-        user_id = message.text.split()[1]
-        users[user_id]["is_pro"] = True
-        save_users()
-
-        bot.send_message(user_id, "🎉 <b>PRO активирован!</b>\nТеперь безлимит 🚀")
-        bot.reply_to(message, "✅ PRO включен")
-    except:
-        bot.reply_to(message, "Используй: /activate USER_ID")
-
-# ================= HELP =================
-@bot.message_handler(func=lambda m: m.text == "❓ Помощь")
-def help_section(message):
-    bot.send_message(
-        message.chat.id,
-        "🤖 Просто напиши вопрос и я отвечу.\n\n"
-        "Хочешь без лимитов? Подключай 💎 PRO."
-    )
-
-# ================= CAREER =================
+# ====== КАРЬЕРА ======
 @bot.message_handler(func=lambda m: m.text == "🚀 Карьера")
 def career(message):
     bot.send_message(
         message.chat.id,
-        "🚀 Раздел карьеры.\n\n"
-        "Напиши:\n"
-        "• Как выбрать профессию?\n"
-        "• Как увеличить доход?\n"
-        "• Как построить стратегию роста?"
+        "🚀 Раздел Карьера\n\n"
+        "📈 Здесь скоро появятся инвестиционные стратегии,\n"
+        "аналитика и рекомендации 💰"
     )
 
-# ================= AI =================
+# ====== ПОМОЩЬ ======
+@bot.message_handler(func=lambda m: m.text == "❓ Помощь")
+def help_section(message):
+    bot.send_message(
+        message.chat.id,
+        "❓ Помощь\n\n"
+        "💬 Чтобы задать вопрос AI — нажмите 🤖 Задать вопрос\n"
+        "💎 Чтобы купить PRO — нажмите PRO"
+    )
+
+# ====== НАЗАД ======
+@bot.message_handler(func=lambda m: m.text == "🔙 Назад")
+def back(message):
+    bot.send_message(
+        message.chat.id,
+        "Главное меню 👇",
+        reply_markup=main_menu()
+    )
+
+# ====== КНОПКА AI ======
 @bot.message_handler(func=lambda m: m.text == "🤖 Задать вопрос")
 def ask_ai(message):
     bot.send_message(
         message.chat.id,
-        "🤖 Напиши свой вопрос 👇"
+        "🤖 Напишите свой вопрос, и я отвечу 👇"
     )
 
-@bot.message_handler(func=lambda m: True)
-def handle_message(message):
-    user = get_user(message.from_user.id)
-
-    if not user["is_pro"]:
-        if user["questions_today"] >= FREE_LIMIT:
-            bot.send_message(
-                message.chat.id,
-                "🚫 Лимит бесплатных вопросов исчерпан.\nПодключи 💎 PRO."
-            )
-            return
-        user["questions_today"] += 1
-        save_users()
-
-    bot.send_chat_action(message.chat.id, "typing")
-
+# ====== AI ОБРАБОТКА ======
+@bot.message_handler(func=lambda m: m.text not in [
+    "👤 Профиль",
+    "💎 PRO",
+    "🚀 Карьера",
+    "❓ Помощь",
+    "🤖 Задать вопрос",
+    "💳 Оплатить PRO",
+    "✅ Я оплатил",
+    "🔙 Назад"
+])
+def handle_ai(message):
     try:
-        system_prompt = (
-            "Ты профессиональный AI-наставник. "
-            "Отвечай красиво, структурировано, с эмодзи."
-        )
-
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": "Ты умный финансовый AI ассистент. Отвечай на русском языке красиво и с эмодзи."},
                 {"role": "user", "content": message.text}
             ]
         )
 
         bot.send_message(
             message.chat.id,
-            response.choices[0].message.content,
-            reply_markup=main_menu()
+            response.choices[0].message.content
         )
 
     except Exception as e:
         bot.send_message(message.chat.id, f"Ошибка: {e}")
 
-# ================= RUN =================
-bot.infinity_polling(skip_pending=True)
+# ====== ЗАПУСК ======
+bot.infinity_polling()
