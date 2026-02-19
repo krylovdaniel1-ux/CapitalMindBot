@@ -159,7 +159,7 @@ def handle_all(message):
     )
 
 # ====== RUN ======
-if name == "main":
+if __name__ == "__main__":
     # чтобы не падал из-за временных сетевых глюков
     while True:
         try:
@@ -167,3 +167,4 @@ if name == "main":
         except Exception as e:
             print("Polling error:", e)
             time.sleep(3)
+
