@@ -1,6 +1,7 @@
 import os
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
+import random
 
 import telebot
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton, LabeledPrice
@@ -11,31 +12,26 @@ from openai import OpenAI
 # =========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN is not set")
+    raise RuntimeError("❌ TELEGRAM_TOKEN не задан в Railway Variables")
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is not set")
+    raise RuntimeError("❌ OPENAI_API_KEY не задан в Railway Variables")
 
-# =========================
-# CONFIG
-# =========================
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-PRO_PRICE_STARS = 200
-PRO_DAYS = 30
-
-# ВАЖНО: XTR = Telegram Stars
-CURRENCY = "XTR"
-PROVIDER_TOKEN = ""  # Для Stars он должен быть пустым
-
-# =========================
-# INIT
-# =========================
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # =========================
-# DB (persist pro & mode)
+# STARS (Telegram)
+# =========================
+PRO_PRICE_STARS = 200
+PRO_DAYS = 30
+CURRENCY = "XTR"          # Telegram Stars
+PROVIDER_TOKEN = ""       # Для Stars — пустой
+
+# =========================
+# DB
 # =========================
 DB_PATH = "bot.db"
 
@@ -49,36 +45,60 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             mode TEXT DEFAULT 'menu',
+            xp INTEGER DEFAULT 0,
+            streak INTEGER DEFAULT 0,
+            last_quest_date TEXT DEFAULT NULL,
             pro_until TEXT DEFAULT NULL
         )
     """)
     conn.commit()
     conn.close()
 
-def set_mode(user_id: int, mode: str):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO users(user_id, mode) VALUES(?, ?) ON CONFLICT(user_id) DO UPDATE SET mode=excluded.mode", (user_id, mode))
-    conn.commit()
-    conn.close()
-
 def get_user(user_id: int):
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT mode, pro_until FROM users WHERE user_id = ?", (user_id,))
+    cur.execute("SELECT mode, xp, streak, last_quest_date, pro_until FROM users WHERE user_id=?", (user_id,))
     row = cur.fetchone()
-    conn.close()
     if not row:
-        return ("menu", None)
-    return row[0], row[1]
+        cur.execute("INSERT INTO users(user_id) VALUES(?)", (user_id,))
+        conn.commit()
+        row = ("menu", 0, 0, None, None)
+    conn.close()
+    return {
+        "mode": row[0],
+        "xp": row[1],
+        "streak": row[2],
+        "last_quest_date": row[3],
+        "pro_until": row[4],
+    }
 
-def set_pro(user_id: int, until_iso: str):
+def set_mode(user_id: int, mode: str):
     conn = db()
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO users(user_id, pro_until) VALUES(?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET pro_until=excluded.pro_until
-    """, (user_id, until_iso))
+    cur.execute("INSERT INTO users(user_id, mode) VALUES(?, ?) ON CONFLICT(user_id) DO UPDATE SET mode=excluded.mode",
+                (user_id, mode))
+    conn.commit()
+    conn.close()
+
+def add_xp(user_id: int, amount: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET xp = COALESCE(xp,0) + ? WHERE user_id=?", (amount, user_id))
+    conn.commit()
+    conn.close()
+
+def set_streak_and_quest_date(user_id: int, streak: int, quest_date_iso: str):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET streak=?, last_quest_date=? WHERE user_id=?",
+                (streak, quest_date_iso, user_id))
+    conn.commit()
+    conn.close()
+
+def set_pro_until(user_id: int, until_iso: str):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET pro_until=? WHERE user_id=?", (until_iso, user_id))
     conn.commit()
     conn.close()
 
@@ -95,130 +115,102 @@ def is_pro_active(pro_until_iso: str) -> bool:
 # UI
 # =========================
 BTN_CAREER = "💼 Карьера"
+BTN_QUEST = "📅 Задание дня"
 BTN_PROFILE = "👤 Профиль"
-BTN_PRO = "⭐ Pro (200⭐/30 дней)"
+BTN_PRO = "⭐ PRO 200⭐"
 BTN_HELP = "🆘 Помощь"
 BTN_MENU = "🏠 Меню"
 
-def main_keyboard():
+def menu_kb():
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton(BTN_CAREER), KeyboardButton(BTN_PROFILE))
-    kb.row(KeyboardButton(BTN_PRO), KeyboardButton(BTN_HELP))
+    kb.row(KeyboardButton(BTN_CAREER), KeyboardButton(BTN_QUEST))
+    kb.row(KeyboardButton(BTN_PROFILE), KeyboardButton(BTN_PRO))
+    kb.row(KeyboardButton(BTN_HELP))
     return kb
 
-def career_keyboard():
+def career_kb():
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(KeyboardButton(BTN_MENU))
     return kb
 
 # =========================
-# TEXTS
+# GAME CONTENT
 # =========================
-WELCOME_TEXT = (
-    "🚀 <b>CapitalMind</b>\n\n"
-    "Я помогу по <b>карьере и работе</b>: резюме, собеседования, профессии, зарплаты, планы развития, навыки.\n\n"
-    "Нажми кнопку ниже 👇"
-)
+QUESTS_FREE = [
+    "Составь 3 предложения о себе для резюме (кто ты, что умеешь, что хочешь).",
+    "Найди 1 вакансию/стажировку и выпиши 3 требования к кандидату.",
+    "Напиши 1 сообщение работодателю/наставнику: кто ты и чем можешь быть полезен.",
+    "Выбери 1 навык и удели 20 минут обучению. Напиши, что именно изучал.",
+    "Составь список из 5 профессий, которые тебе интересны, и почему.",
+]
 
-HELP_TEXT = (
-    "🧠 <b>Как пользоваться</b>\n\n"
-    f"1) Нажми <b>{BTN_CAREER}</b> — включится режим карьеры.\n"
-    "2) После этого просто пиши вопрос — я отвечу.\n\n"
-    f"⭐ <b>Pro</b>: 200⭐ на 30 дней (покажу расширенные ответы и чек-листы).\n"
-    "⚠️ Я отвечаю только по теме карьеры/работы."
-)
+QUESTS_PRO = [
+    "Сделай мини-резюме (5 пунктов): цель, навыки, проекты/опыт, достижения, контакты. Пришли — улучшу.",
+    "Подготовь ответы на 5 вопросов собеседования: о себе, сильные/слабые стороны, опыт, конфликт, цель.",
+    "Сделай план заработка на 7 дней: 1 услуга/навык → где найти клиентов → 1 действие в день.",
+    "Составь портфолио-идею: 1 проект за 3 дня. Опиши тему, результат, как показать.",
+    "Напиши 3 варианта cold-message для поиска подработки (разные стили).",
+]
 
-CAREER_START_TEXT = (
-    "💼 <b>Режим “Карьера” включён</b> ✅\n\n"
-    "Пиши вопрос по работе.\n\n"
-    "Примеры:\n"
-    "• «Составь резюме на позицию…»\n"
-    "• «Подготовь ответы на собеседование…»\n"
-    "• «Какие навыки нужны для…?»\n"
-    "• «Как поднять зарплату?»\n\n"
-    "Я отвечу быстро и по делу 😎"
-)
-
-PRO_INFO_TEXT = (
-    "⭐ <b>Pro подписка</b>\n\n"
-    f"Цена: <b>{PRO_PRICE_STARS}⭐</b> на <b>{PRO_DAYS} дней</b>.\n\n"
-    "Что даёт Pro:\n"
-    "✅ Более подробные планы и чек-листы\n"
-    "✅ Больше примеров + структура действий\n"
-    "✅ Более длинные ответы и разборы\n\n"
-    "Нажми кнопку оплаты — Telegram сам покажет окно оплаты ⭐"
-)
+def pick_daily_quest(is_pro: bool) -> str:
+    pool = QUESTS_PRO if is_pro else QUESTS_FREE
+    return random.choice(pool)
 
 # =========================
-# AI
+# AI PROMPT (Career only)
 # =========================
 CAREER_SYSTEM_PROMPT = (
-    "Ты — карьерный ассистент. Отвечай ТОЛЬКО по теме карьеры, работы, профессий, резюме, собеседований, "
-    "зарплаты, навыков, обучения, выбора специальности, коммуникации на работе, карьерного роста.\n"
-    "Если вопрос не относится к работе/карьере — вежливо откажись и попроси переформулировать в контексте карьеры.\n"
-    "Пиши по-русски. Используй дружелюбный тон и умеренно эмодзи.\n"
-    "Структурируй ответ: коротко, затем пункты/шаги."
+    "Ты карьерный наставник. Отвечай ТОЛЬКО по темам работы и карьеры: "
+    "профессии, навыки, обучение, резюме/CV, портфолио, собеседования, "
+    "поиск стажировки/работы, зарплата, переговоры, фриланс, первые деньги. "
+    "Если вопрос НЕ про карьеру/работу — вежливо откажись и попроси переформулировать в карьерном контексте. "
+    "Отвечай на русском, дружелюбно, 1–3 эмодзи, структурировано (шаги/список)."
 )
 
-def ai_answer_career(user_text: str, pro: bool) -> str:
-    # Для Pro делаем ответы более подробными
-    detail_hint = (
-        "Пользователь Pro: дай расширенный ответ, добавь чек-лист, примеры формулировок и план на 7 дней."
+def ai_career_answer(user_text: str, pro: bool) -> str:
+    pro_hint = (
+        "Пользователь PRO: дай расширенный ответ, добавь чек-лист, примеры фраз и план на 7 дней."
         if pro else
-        "Пользователь не Pro: ответ будь кратким и практичным, без лишней воды."
+        "Пользователь Free: ответ краткий и практичный, 5–8 пунктов максимум."
     )
-
     resp = client.chat.completions.create(
-        model=MODEL,
+        model=OPENAI_MODEL,
         messages=[
             {"role": "system", "content": CAREER_SYSTEM_PROMPT},
-            {"role": "system", "content": detail_hint},
+            {"role": "system", "content": pro_hint},
             {"role": "user", "content": user_text},
         ],
-        temperature=0.6,
+        temperature=0.6
     )
-    return resp.choices[0].message.content
+    return (resp.choices[0].message.content or "").strip()
 
 # =========================
-# COMMANDS / START
+# MESSAGES
+# =========================
+WELCOME = (
+    "🚀 <b>CapitalMind</b>\n\n"
+    "Я — карьерный AI-наставник. Помогаю выбрать направление, заработать первые деньги, "
+    "сделать резюме и пройти собеседование 💼\n\n"
+    "Нажми <b>💼 Карьера</b> и задай вопрос.\n"
+    "Или возьми <b>📅 Задание дня</b> — прокачаемся по шагам 🎯"
+)
+
+HELP = (
+    "🆘 <b>Помощь</b>\n\n"
+    f"• <b>{BTN_CAREER}</b> — включить режим карьеры (я отвечаю только по работе)\n"
+    f"• <b>{BTN_QUEST}</b> — ежедневное задание + XP\n"
+    f"• <b>{BTN_PRO}</b> — подписка на 30 дней за 200⭐\n\n"
+    "⚠️ Если спросишь не про карьеру — я попрошу переформулировать."
+)
+
+CAREER_ON = (
+    "💼 <b>Режим «Карьера» включён</b> ✅\n\n"
+    "Пиши вопрос по работе/навыкам/резюме/заработку.\n"
+    "Я отвечу структурировано и по делу 😎"
+)
+
+# =========================
+# START / MENU
 # =========================
 @bot.message_handler(commands=["start"])
-def start_cmd(message):
-    set_mode(message.from_user.id, "menu")
-    bot.send_message(message.chat.id, WELCOME_TEXT, reply_markup=main_keyboard())
-
-# =========================
-# BUTTON HANDLERS
-# =========================
-@bot.message_handler(func=lambda m: m.text == BTN_HELP)
-def help_btn(message):
-    bot.send_message(message.chat.id, HELP_TEXT, reply_markup=main_keyboard())
-
-@bot.message_handler(func=lambda m: m.text == BTN_MENU)
-def menu_btn(message):
-    set_mode(message.from_user.id, "menu")
-    bot.send_message(message.chat.id, "🏠 Ты в меню. Выбирай кнопку 👇", reply_markup=main_keyboard())
-
-@bot.message_handler(func=lambda m: m.text == BTN_CAREER)
-def career_btn(message):
-    # типичный ответ (как ты просил) + потом ИИ уже на вопросы
-    set_mode(message.from_user.id, "career")
-    bot.send_message(message.chat.id, CAREER_START_TEXT, reply_markup=career_keyboard())
-
-@bot.message_handler(func=lambda m: m.text == BTN_PROFILE)
-def profile_btn(message):
-    mode, pro_until = get_user(message.from_user.id)
-    active = is_pro_active(pro_until)
-    if active:
-        until = datetime.fromisoformat(pro_until).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        pro_line = f"⭐ Pro: <b>активен</b> до <b>{until}</b>"
-    else:
-        pro_line = "⭐ Pro: <b>не активен</b>"
-
-    text = (
-        "👤 <b>Профиль</b>\n\n"
-        f"🧭 Режим: <b>{mode}</b>\n"
-        f"{pro_line}\n\n"
-        "Хочешь — включай 💼 Карьера и задавай вопросы 😎"
-    )
-    bot.se
+def cmd_s
