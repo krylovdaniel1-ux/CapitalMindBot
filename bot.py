@@ -585,28 +585,23 @@ def handle_text(message):
             bot.send_message(message.chat.id, base_plan_for(result), reply_markup=main_kb())
 
             # PRO доп-разбор от AI
-            if pro:
-                try:
-                    bot.send_message(message.chat.id, "🧠 PRO-разбор: делаю персональные советы… ✨", reply_markup=main_kb())
-                    ai = ai_answer_career(
-                        f"По результату теста направление = {result}. "
-                        "Сделай план на 30 дней + список навыков + 3 идеи заработка для подростка/студента.",
-                        pro=True
-                    )
-                    bot.send_message(message.chat.id, ai, reply_markup=main_kb())
-except Exception as e:
-                    bot.send_message(message.chat.id, f"⚠️ Ошибка AI: <code>{str(e)[:160]}</code>", reply_markup=main_kb())
+           if pro:
+    try:
+        bot.send_message(message.chat.id, "💎 PRO-разбор: делаю анализ...")
 
-            else:
-                bot.send_message(
-                    message.chat.id,
-                    "🔒 Хочешь PRO-разбор теста (план на 30 дней + идеи заработка)?\n"
-                    f"Открой PRO за <b>{PRO_PRICE_STARS}⭐</b> ⭐",
-                    reply_markup=main_kb()
-                )
+        ai = ai_answer_career(
+            f"По результату теста направление = {result}. "
+            f"Сделай план на 30 дней + список навыков + 3 идеи заработка.",
+            pro=True
+        )
 
-            set_mode(message.from_user.id, "menu")
-            return
+        bot.send_message(message.chat.id, ai, reply_markup=main_kb())
+
+    except Exception as e:
+        bot.send_message(
+            message.chat.id,
+            f"⚠️ Ошибка AI: {e}"
+        )
 
     # ===== CAREER MODE =====
     if mode == "career":
@@ -640,3 +635,4 @@ if name == "__main__":
         except Exception as e:
             print("Polling error:", e)
             time.sleep(3)
+
