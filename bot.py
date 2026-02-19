@@ -9,222 +9,229 @@ from telebot.types import LabeledPrice
 
 from openai import OpenAI
 
-# ======================
-# CONFIG
-# ======================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+# =========================
+# ENV
+# =========================
+TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
+OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN is missing in environment variables")
+    raise RuntimeError("❌ TELEGRAM_TOKEN не задан в Railway Variables")
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is missing in environment variables")
+    raise RuntimeError("❌ OPENAI_API_KEY не задан в Railway Variables")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-DB_PATH = "bot.db"
 UTC = timezone.utc
+DB_PATH = "bot.db"
 
-PRO_PRICE_STARS = 200          # 200 ⭐
-PRO_DAYS = 30                  # 30 дней
+# =========================
+# STARS / PRO
+# =========================
+PRO_PRICE_STARS = 200
+PRO_DAYS = 30
+STARS_CURRENCY = "XTR"     # Telegram Stars
+PROVIDER_TOKEN = ""        # Для Stars оставляем пустым
 PRO_PAYLOAD = "capitalmind_pro_30d"
-PRO_CURRENCY = "XTR"           # Telegram Stars currency tag
-SUPPORT_USERNAME = "@CapitalMind360_bot"  # можешь поменять на свой @username
 
-# ======================
+# =========================
+# UI TEXT BUTTONS
+# =========================
+BTN_CAREER = "💼 Карьера"
+BTN_TEST = "🧠 Тест"
+BTN_PROFILE = "👤 Профиль"
+BTN_PRO = "⭐ PRO (200⭐)"
+BTN_HELP = "🆘 Помощь"
+BTN_MENU = "🏠 Меню"
+BTN_EXIT_CAREER = "⬅️ Выйти из карьеры"
+
+# =========================
 # DB
-# ======================
+# =========================
 def db():
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
-    con.execute("PRAGMA journal_mode=WAL;")
-    return con
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
-con = db()
-con.execute("""
-CREATE TABLE IF NOT EXISTS users (
-  user_id INTEGER PRIMARY KEY,
-  username TEXT,
-  first_name TEXT,
-  mode TEXT DEFAULT 'none',
-  pro_until INTEGER DEFAULT 0,
-  created_at INTEGER DEFAULT 0
-);
-""")
-con.commit()
+def init_db():
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            first_name TEXT,
+            username TEXT,
+            pro_until TEXT DEFAULT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS state (
+            user_id INTEGER PRIMARY KEY,
+            mode TEXT DEFAULT 'menu',
+            test_step INTEGER DEFAULT 0,
+            score_it INTEGER DEFAULT 0,
+            score_business INTEGER DEFAULT 0,
+            score_creative INTEGER DEFAULT 0,
+            score_analytics INTEGER DEFAULT 0
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-def upsert_user(u: types.User):
-    now = int(time.time())
-    con.execute("""
-    INSERT INTO users(user_id, username, first_name, mode, pro_until, created_at)
-    VALUES(?,?,?,?,?,?)
-    ON CONFLICT(user_id) DO UPDATE SET
-      username=excluded.username,
-      first_name=excluded.first_name
-    """, (u.id, u.username or "", u.first_name or "", "none", 0, now))
-    con.commit()
+def ensure_user(user):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM users WHERE user_id=?", (user.id,))
+    if not cur.fetchone():
+        cur.execute(
+            "INSERT INTO users(user_id, first_name, username, pro_until) VALUES(?,?,?,NULL)",
+            (user.id, user.first_name or "", user.username or "")
+        )
+    else:
+        cur.execute(
+            "UPDATE users SET first_name=?, username=? WHERE user_id=?",
+            (user.first_name or "", user.username or "", user.id)
+        )
+
+    cur.execute("SELECT user_id FROM state WHERE user_id=?", (user.id,))
+    if not cur.fetchone():
+        cur.execute(
+            "INSERT INTO state(user_id, mode, test_step, score_it, score_business, score_creative, score_analytics) "
+            "VALUES(?, 'menu', 0, 0, 0, 0, 0)",
+            (user.id,)
+        )
+    conn.commit()
+    conn.close()
 
 def set_mode(user_id: int, mode: str):
-    con.execute("UPDATE users SET mode=? WHERE user_id=?", (mode, user_id))
-    con.commit()
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("UPDATE state SET mode=? WHERE user_id=?", (mode, user_id))
+    conn.commit()
+    conn.close()
 
-def get_user(user_id: int):
-    cur = con.execute("SELECT user_id, username, first_name, mode, pro_until FROM users WHERE user_id=?", (user_id,))
+def get_state(user_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT mode, test_step, score_it, score_business, score_creative, score_analytics FROM state WHERE user_id=?", (user_id,))
     row = cur.fetchone()
+    conn.close()
+    if not row:
+        return ("menu", 0, 0, 0, 0, 0)
     return row
 
+def reset_test(user_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE state
+        SET test_step=0, score_it=0, score_business=0, score_creative=0, score_analytics=0, mode='test'
+        WHERE user_id=?
+    """, (user_id,))
+    conn.commit()
+    conn.close()
+
+def add_score(user_id: int, it=0, business=0, creative=0, analytics=0):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE state
+        SET score_it = score_it + ?,
+            score_business = score_business + ?,
+            score_creative = score_creative + ?,
+            score_analytics = score_analytics + ?
+        WHERE user_id=?
+    """, (it, business, creative, analytics, user_id))
+    conn.commit()
+    conn.close()
+
+def set_test_step(user_id: int, step: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("UPDATE state SET test_step=? WHERE user_id=?", (step, user_id))
+    conn.commit()
+    conn.close()
+
+def get_pro_until(user_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT pro_until FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def set_pro_until(user_id: int, until_iso: str):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET pro_until=? WHERE user_id=?", (until_iso, user_id))
+    conn.commit()
+    conn.close()
+
 def is_pro(user_id: int) -> bool:
-    row = get_user(user_id)
-    if not row:
+    pro_until = get_pro_until(user_id)
+    if not pro_until:
         return False
-    pro_until = int(row[4] or 0)
-    return pro_until > int(time.time())
+    try:
+        until = datetime.fromisoformat(pro_until)
+        return datetime.now(UTC) < until
+    except Exception:
+        return False
 
-def add_pro(user_id: int, days: int):
-    now = int(time.time())
-    row = get_user(user_id)
-    current_until = int(row[4] or 0) if row else 0
-    base = max(now, current_until)
-    new_until = int(base + days * 86400)
-    con.execute("UPDATE users SET pro_until=? WHERE user_id=?", (new_until, user_id))
-    con.commit()
-    return new_until
-
-# ======================
-# UI
-# ======================
-BTN_CAREER = "💼 Карьера"
-BTN_PROFILE = "👤 Профиль"
-BTN_TEST = "🧠 Тест"
-BTN_PRO = "⭐ PRO (200⭐ / 30 дней)"
-
+# =========================
+# KEYBOARDS
+# =========================
 def main_kb():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(types.KeyboardButton(BTN_CAREER), types.KeyboardButton(BTN_PROFILE))
-    kb.row(types.KeyboardButton(BTN_TEST), types.KeyboardButton(BTN_PRO))
+    kb.row(types.KeyboardButton(BTN_CAREER), types.KeyboardButton(BTN_TEST))
+    kb.row(types.KeyboardButton(BTN_PROFILE), types.KeyboardButton(BTN_PRO))
+    kb.row(types.KeyboardButton(BTN_HELP), types.KeyboardButton(BTN_MENU))
     return kb
 
-# ======================
+def career_kb():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(types.KeyboardButton(BTN_EXIT_CAREER), types.KeyboardButton(BTN_MENU))
+    return kb
+
+def test_kb(options):
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for row in options:
+        kb.row(*[types.KeyboardButton(x) for x in row])
+    kb.row(types.KeyboardButton(BTN_MENU))
+    return kb
+
+# =========================
 # TEXTS
-# ======================
+# =========================
 WELCOME = (
     "🚀 <b>CapitalMind</b>\n\n"
-    "Я карьерный помощник: резюме, собеседования, навыки, поиск работы.\n"
-    "Выбери кнопку ниже 👇"
+    "Я — карьерный бот.\n"
+    "✅ В режиме <b>Карьера</b> отвечает AI только по работе/навыкам/резюме/заработку.\n"
+    "🧠 В <b>Тесте</b> подбираю направление и даю план.\n\n"
+    "Выбирай кнопки ниже 👇"
 )
 
-CAREER_INTRO = (
-    "💼 <b>Режим карьеры включён</b>\n\n"
-    "Напиши вопрос про работу.\n"
-    "Примеры:\n"
-    "• «Сделай резюме под вакансию…»\n"
-    "• «Как отвечать на вопрос про зарплату?»\n"
-    "• «Составь план изучения Python для джуна»\n\n"
-    "🙂 Я отвечаю <b>только</b> по карьерной теме."
-)
-
-NOT_CAREER_TOPIC = (
-    "🙂 Я заточен только под <b>карьеру и работу</b>.\n"
-    "Спроси про резюме, собеседование, навыки, вакансии или карьерный план 👇"
-)
-
-PROFILE_TEXT = (
-    "👤 <b>Профиль</b>\n"
-    "• Пользователь: {name}\n"
-    "• PRO: {pro}\n"
-    "• До: {until}\n"
-)
-
-TEST_Q = (
-    "🧠 <b>Мини-тест (карьера)</b>\n\n"
-    "Вопрос:\n"
-    "Как лучше ответить на собеседовании на «Расскажите о себе»?\n\n"
-    "A) Пересказать всю биографию с детсада\n"
-    "B) Коротко: кто я, ключевые навыки, 1–2 достижения, почему подхожу\n"
-    "C) Сказать «не знаю»\n\n"
-    "Напиши букву: A / B / C"
-)
-
-TEST_OK = "✅ Верно! Самый сильный вариант — <b>B</b>."
-TEST_BAD = "❌ Почти. Правильный ответ — <b>B</b> (структурно и по делу)."
-
-PRO_INFO = (
-    "⭐ <b>PRO-подписка</b>\n\n"
-    "• Цена: <b>200⭐</b>\n"
-    "• Срок: <b>30 дней</b>\n"
-    "• Дает: приоритетные ответы + больше лимитов (можно расширять дальше)\n\n"
-    "Нажми кнопку оплаты ниже 👇"
+HELP = (
+    "🆘 <b>Помощь</b>\n\n"
+    f"• <b>{BTN_CAREER}</b> — AI отвечает только по карьере 💼\n"
+    f"• <b>{BTN_TEST}</b> — мини-тест → направление + советы 🧠\n"
+    f"• <b>{BTN_PROFILE}</b> — статус PRO 👤\n"
+    f"• <b>{BTN_PRO}</b> — PRO на 30 дней за 200⭐ ⭐\n\n"
+    "Команды:\n"
+    "/start — меню\n"
+    "/terms — условия\n"
+    "/paysupport — поддержка оплат"
 )
 
 TERMS = (
-    "📜 <b>Условия</b>\n"
-    "Оплачивая PRO, ты получаешь доступ на 30 дней.\n"
-    "Если есть вопросы по оплате: /paysupport\n"
+    "📜 <b>Условия</b>\n\n"
+    "• Бот даёт рекомендации по карьере и обучению.\n"
+    "• Не вводи пароли/коды/карты.\n"
+    "• PRO — цифровая услуга на 30 дней.\n"
 )
 
 PAY_SUPPORT = (
-    "🆘 <b>Поддержка по оплатам</b>\n"
-    f"Напиши нам в Telegram: {SUPPORT_USERNAME}\n"
-    "Укажи: дату, сумму (⭐), и что случилось."
-)
-
-# ======================
-# OPENAI (career-only)
-# ======================
-SYSTEM_PROMPT = (
-    "Ты — карьерный ассистент для Telegram-бота. "
-    "Отвечай только по теме: работа, карьера, резюме, собеседования, навыки, поиск вакансий, "
-    "переговоры о зарплате, планы обучения для профессии, рабочие ситуации. "
-    "Если вопрос не про карьеру/работу — вежливо откажись и предложи задать карьерный вопрос. "
-    "Пиши по-русски, дружелюбно, с лёгкими эмодзи. "
-    "Ответы делай практичными: шаги + пример(ы)."
-)
-
-def ai_answer(user_text: str) -> str:
-    # лёгкая фильтрация по ключевым словам (чтобы AI не уходил в “всё подряд”)
-    career_keywords = [
-        "работ", "карьер", "резюме", "cv", "собесед", "ваканс", "зарплат", "офер",
-        "портфолио", "skill", "навык", "hr", "рекрутер", "linkedin", "опыт", "должност"
-    ]
-    text_low = user_text.lower()
-    if not any(k in text_low for k in career_keywords):
-        return NOT_CAREER_TOPIC
-
-    resp = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_text}
-        ],
-        temperature=0.6,
-    )
-    return resp.choices[0].message.content.strip()
-
-# ======================
-# COMMANDS
-# ======================
-@bot.message_handler(commands=["start"])
-def cmd_start(message):
-    upsert_user(message.from_user)
-    bot.send_message(message.chat.id, WELCOME, reply_markup=main_kb())
-
-@bot.message_handler(commands=["terms"])
-def cmd_terms(message):
-    bot.send_message(message.chat.id, TERMS, reply_markup=main_kb())
-
-@bot.message_handler(commands=["paysupport"])
-def cmd_paysupport(message):
-    bot.send_message(message.chat.id, PAY_SUPPORT, reply_markup=main_kb())
-
-@bot.message_handler(commands=["profile"])
-def cmd_profile(message):
-    upsert_user(message.from_user)
-    row = get_user(message.from_user.id)
-    pro = is_pro(message.from_user.id)
-    until_ts = int(row[4] or 0) if row else 0
-    until = "—"
-    if until_ts > 0:
-        until = datetime.fromtimestamp(until_ts, tz=UTC).strftime("%d.%m.%Y %H:%M (UTC)")
-    name = (message.from_user.first_name or "User")
-    bot.send_message(
-        mes
+    "💳 <b>Поддержка оплат</b>\n\n"
+    "Если платёж не проходит:\n"
+    "• перезапусти Telegram\n"
+    "• попробуй снова через 2–5 минут\n"
+    "• проверь, что у
