@@ -1,170 +1,230 @@
 import os
 import time
+import sqlite3
+from datetime import datetime, timedelta, timezone
+
 import telebot
 from telebot import types
+from telebot.types import LabeledPrice
+
 from openai import OpenAI
 
-# ====== ENV ======
+# ======================
+# CONFIG
+# ======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("❌ Не найден TELEGRAM_TOKEN в переменных окружения Railway")
+    raise RuntimeError("TELEGRAM_TOKEN is missing in environment variables")
 if not OPENAI_API_KEY:
-    raise RuntimeError("❌ Не найден OPENAI_API_KEY в переменных окружения Railway")
+    raise RuntimeError("OPENAI_API_KEY is missing in environment variables")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ====== SIMPLE STATE (сбрасывается при перезапуске) ======
-user_mode = {}  # chat_id -> "career" | None
+DB_PATH = "bot.db"
+UTC = timezone.utc
 
-# ====== UI ======
+PRO_PRICE_STARS = 200          # 200 ⭐
+PRO_DAYS = 30                  # 30 дней
+PRO_PAYLOAD = "capitalmind_pro_30d"
+PRO_CURRENCY = "XTR"           # Telegram Stars currency tag
+SUPPORT_USERNAME = "@CapitalMind360_bot"  # можешь поменять на свой @username
+
+# ======================
+# DB
+# ======================
+def db():
+    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con.execute("PRAGMA journal_mode=WAL;")
+    return con
+
+con = db()
+con.execute("""
+CREATE TABLE IF NOT EXISTS users (
+  user_id INTEGER PRIMARY KEY,
+  username TEXT,
+  first_name TEXT,
+  mode TEXT DEFAULT 'none',
+  pro_until INTEGER DEFAULT 0,
+  created_at INTEGER DEFAULT 0
+);
+""")
+con.commit()
+
+def upsert_user(u: types.User):
+    now = int(time.time())
+    con.execute("""
+    INSERT INTO users(user_id, username, first_name, mode, pro_until, created_at)
+    VALUES(?,?,?,?,?,?)
+    ON CONFLICT(user_id) DO UPDATE SET
+      username=excluded.username,
+      first_name=excluded.first_name
+    """, (u.id, u.username or "", u.first_name or "", "none", 0, now))
+    con.commit()
+
+def set_mode(user_id: int, mode: str):
+    con.execute("UPDATE users SET mode=? WHERE user_id=?", (mode, user_id))
+    con.commit()
+
+def get_user(user_id: int):
+    cur = con.execute("SELECT user_id, username, first_name, mode, pro_until FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    return row
+
+def is_pro(user_id: int) -> bool:
+    row = get_user(user_id)
+    if not row:
+        return False
+    pro_until = int(row[4] or 0)
+    return pro_until > int(time.time())
+
+def add_pro(user_id: int, days: int):
+    now = int(time.time())
+    row = get_user(user_id)
+    current_until = int(row[4] or 0) if row else 0
+    base = max(now, current_until)
+    new_until = int(base + days * 86400)
+    con.execute("UPDATE users SET pro_until=? WHERE user_id=?", (new_until, user_id))
+    con.commit()
+    return new_until
+
+# ======================
+# UI
+# ======================
 BTN_CAREER = "💼 Карьера"
 BTN_PROFILE = "👤 Профиль"
-BTN_PRO = "⭐ Pro (200 звёзд)"
-BTN_HELP = "🆘 Помощь"
-BTN_EXIT = "⬅️ Выйти из Карьеры"
+BTN_TEST = "🧠 Тест"
+BTN_PRO = "⭐ PRO (200⭐ / 30 дней)"
 
-def main_menu_keyboard():
+def main_kb():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(types.KeyboardButton(BTN_CAREER), types.KeyboardButton(BTN_PROFILE))
-    kb.add(types.KeyboardButton(BTN_PRO), types.KeyboardButton(BTN_HELP))
+    kb.row(types.KeyboardButton(BTN_CAREER), types.KeyboardButton(BTN_PROFILE))
+    kb.row(types.KeyboardButton(BTN_TEST), types.KeyboardButton(BTN_PRO))
     return kb
 
-def career_keyboard():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(types.KeyboardButton(BTN_EXIT))
-    return kb
+# ======================
+# TEXTS
+# ======================
+WELCOME = (
+    "🚀 <b>CapitalMind</b>\n\n"
+    "Я карьерный помощник: резюме, собеседования, навыки, поиск работы.\n"
+    "Выбери кнопку ниже 👇"
+)
 
-# ====== TEXTS ======
-WELCOME_TEXT = (
-    "🚀 <b>CapitalMind</b> на связи!\n\n"
-    "Я помогу по теме <b>карьеры</b>: профессии, резюме, собеседования, навыки, план развития.\n\n"
-    "Выбирай кнопку 👇"
+CAREER_INTRO = (
+    "💼 <b>Режим карьеры включён</b>\n\n"
+    "Напиши вопрос про работу.\n"
+    "Примеры:\n"
+    "• «Сделай резюме под вакансию…»\n"
+    "• «Как отвечать на вопрос про зарплату?»\n"
+    "• «Составь план изучения Python для джуна»\n\n"
+    "🙂 Я отвечаю <b>только</b> по карьерной теме."
+)
+
+NOT_CAREER_TOPIC = (
+    "🙂 Я заточен только под <b>карьеру и работу</b>.\n"
+    "Спроси про резюме, собеседование, навыки, вакансии или карьерный план 👇"
 )
 
 PROFILE_TEXT = (
-    "👤 <b>Профиль</b>\n\n"
-    "Пока в разработке, но скоро тут будет:\n"
-    "• твои цели 🎯\n"
-    "• прогресс 📈\n"
-    "• история вопросов 🧠\n\n"
-    "А пока заходи в <b>Карьера</b> — там уже работает ИИ 🙂"
+    "👤 <b>Профиль</b>\n"
+    "• Пользователь: {name}\n"
+    "• PRO: {pro}\n"
+    "• До: {until}\n"
 )
 
-PRO_TEXT = (
-    "⭐ <b>Pro (200 звёзд)</b>\n\n"
-    "Сейчас честно: <b>авто-оплата звёздами</b> в твоём боте ещё не подключена.\n"
-    "Чтобы принимать платежи официально, нужен платёжный провайдер Telegram (через BotFather → Payments).\n\n"
-    "✅ Что можно сделать уже сейчас:\n"
-    "1) Я сделаю кнопку Pro и доступ к фишкам (лимиты/режимы) ✅\n"
-    "2) Оплату подключим, когда выберешь провайдера (Portmone/Redsys и т.д.)\n\n"
-    "Напиши: <b>Хочу Pro</b> — и я подскажу, что именно выбрать под Украину/твою ситуацию."
+TEST_Q = (
+    "🧠 <b>Мини-тест (карьера)</b>\n\n"
+    "Вопрос:\n"
+    "Как лучше ответить на собеседовании на «Расскажите о себе»?\n\n"
+    "A) Пересказать всю биографию с детсада\n"
+    "B) Коротко: кто я, ключевые навыки, 1–2 достижения, почему подхожу\n"
+    "C) Сказать «не знаю»\n\n"
+    "Напиши букву: A / B / C"
 )
 
-HELP_TEXT = (
-    "🆘 <b>Помощь</b>\n\n"
-    "• Нажми <b>💼 Карьера</b> и задай вопрос (например: «какая профессия мне подходит?»)\n"
-    "• <b>👤 Профиль</b> — скоро добавим\n"
-    "• <b>⭐ Pro</b> — подключим оплату официально через провайдера\n\n"
-    "Команды:\n"
-    "• /start — меню\n"
-    "• /career — режим карьеры\n"
-    "• /exit — выйти из карьеры"
+TEST_OK = "✅ Верно! Самый сильный вариант — <b>B</b>."
+TEST_BAD = "❌ Почти. Правильный ответ — <b>B</b> (структурно и по делу)."
+
+PRO_INFO = (
+    "⭐ <b>PRO-подписка</b>\n\n"
+    "• Цена: <b>200⭐</b>\n"
+    "• Срок: <b>30 дней</b>\n"
+    "• Дает: приоритетные ответы + больше лимитов (можно расширять дальше)\n\n"
+    "Нажми кнопку оплаты ниже 👇"
 )
 
-# ====== AI (Career only) ======
-def career_ai_answer(user_text: str) -> str:
-    # Жёстко ограничиваем тематику: карьера/работа/образование/навыки
-    system_prompt = (
-        "Ты — карьерный консультант. Отвечай ТОЛЬКО по теме карьеры: "
-        "профессии, резюме, собеседования, навыки, обучение, поиск работы, "
-        "фриланс/стажировки, план развития. "
-        "Если вопрос не про карьеру — вежливо откажись и попроси задать вопрос про карьеру. "
-        "Пиши по-русски, дружелюбно, со смайликами, короткими списками."
-    )
+TERMS = (
+    "📜 <b>Условия</b>\n"
+    "Оплачивая PRO, ты получаешь доступ на 30 дней.\n"
+    "Если есть вопросы по оплате: /paysupport\n"
+)
+
+PAY_SUPPORT = (
+    "🆘 <b>Поддержка по оплатам</b>\n"
+    f"Напиши нам в Telegram: {SUPPORT_USERNAME}\n"
+    "Укажи: дату, сумму (⭐), и что случилось."
+)
+
+# ======================
+# OPENAI (career-only)
+# ======================
+SYSTEM_PROMPT = (
+    "Ты — карьерный ассистент для Telegram-бота. "
+    "Отвечай только по теме: работа, карьера, резюме, собеседования, навыки, поиск вакансий, "
+    "переговоры о зарплате, планы обучения для профессии, рабочие ситуации. "
+    "Если вопрос не про карьеру/работу — вежливо откажись и предложи задать карьерный вопрос. "
+    "Пиши по-русски, дружелюбно, с лёгкими эмодзи. "
+    "Ответы делай практичными: шаги + пример(ы)."
+)
+
+def ai_answer(user_text: str) -> str:
+    # лёгкая фильтрация по ключевым словам (чтобы AI не уходил в “всё подряд”)
+    career_keywords = [
+        "работ", "карьер", "резюме", "cv", "собесед", "ваканс", "зарплат", "офер",
+        "портфолио", "skill", "навык", "hr", "рекрутер", "linkedin", "опыт", "должност"
+    ]
+    text_low = user_text.lower()
+    if not any(k in text_low for k in career_keywords):
+        return NOT_CAREER_TOPIC
 
     resp = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4.1-mini",
         messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text},
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_text}
         ],
-        temperature=0.7,
+        temperature=0.6,
     )
     return resp.choices[0].message.content.strip()
 
-# ====== HANDLERS ======
+# ======================
+# COMMANDS
+# ======================
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
-    user_mode[message.chat.id] = None
-    bot.send_message(message.chat.id, WELCOME_TEXT, reply_markup=main_menu_keyboard())
+    upsert_user(message.from_user)
+    bot.send_message(message.chat.id, WELCOME, reply_markup=main_kb())
 
-@bot.message_handler(commands=["career"])
-def cmd_career(message):
-    user_mode[message.chat.id] = "career"
+@bot.message_handler(commands=["terms"])
+def cmd_terms(message):
+    bot.send_message(message.chat.id, TERMS, reply_markup=main_kb())
+
+@bot.message_handler(commands=["paysupport"])
+def cmd_paysupport(message):
+    bot.send_message(message.chat.id, PAY_SUPPORT, reply_markup=main_kb())
+
+@bot.message_handler(commands=["profile"])
+def cmd_profile(message):
+    upsert_user(message.from_user)
+    row = get_user(message.from_user.id)
+    pro = is_pro(message.from_user.id)
+    until_ts = int(row[4] or 0) if row else 0
+    until = "—"
+    if until_ts > 0:
+        until = datetime.fromtimestamp(until_ts, tz=UTC).strftime("%d.%m.%Y %H:%M (UTC)")
+    name = (message.from_user.first_name or "User")
     bot.send_message(
-        message.chat.id,
-        "💼 <b>Режим Карьера включён</b> ✅\n\nЗадай вопрос про карьеру 👇",
-        reply_markup=career_keyboard()
-    )
-
-@bot.message_handler(commands=["exit"])
-def cmd_exit(message):
-    user_mode[message.chat.id] = None
-    bot.send_message(message.chat.id, "⬅️ Ок, вышел из режима Карьера.", reply_markup=main_menu_keyboard())
-
-@bot.message_handler(func=lambda m: True)
-def handle_all(message):
-    text = (message.text or "").strip()
-    chat_id = message.chat.id
-
-    # кнопки меню
-    if text == BTN_CAREER:
-        return cmd_career(message)
-
-    if text == BTN_EXIT:
-        return cmd_exit(message)
-
-    if text == BTN_PROFILE:
-        user_mode[chat_id] = None
-        bot.send_message(chat_id, PROFILE_TEXT, reply_markup=main_menu_keyboard())
-        return
-
-    if text == BTN_PRO:
-        user_mode[chat_id] = None
-        bot.send_message(chat_id, PRO_TEXT, reply_markup=main_menu_keyboard())
-        return
-
-    if text == BTN_HELP:
-        bot.send_message(chat_id, HELP_TEXT, reply_markup=main_menu_keyboard())
-        return
-
-    # если включён режим карьеры -> отвечает ИИ
-    if user_mode.get(chat_id) == "career":
-        bot.send_chat_action(chat_id, "typing")
-        try:
-            answer = career_ai_answer(text)
-            bot.send_message(chat_id, answer, reply_markup=career_keyboard())
-        except Exception as e:
-            bot.send_message(chat_id, f"⚠️ Ошибка ИИ: <code>{e}</code>\nПопробуй ещё раз.", reply_markup=career_keyboard())
-        return
-
-    # если не в режиме карьеры — направляем
-    bot.send_message(
-        chat_id,
-        "🙂 Я отвечаю через ИИ только в режиме <b>💼 Карьера</b>.\nНажми кнопку <b>💼 Карьера</b> и задай вопрос.",
-        reply_markup=main_menu_keyboard()
-    )
-
-# ====== RUN ======
-if __name__ == "__main__":
-    # чтобы не падал из-за временных сетевых глюков
-    while True:
-        try:
-            bot.infinity_polling(timeout=30, long_polling_timeout=30)
-        except Exception as e:
-            print("Polling error:", e)
-            time.sleep(3)
-
+        mes
